@@ -10,14 +10,19 @@ import com.icegreen.greenmail.foedus.util.Workspace;
 import com.icegreen.greenmail.server.ProtocolHandler;
 import com.icegreen.greenmail.smtp.commands.SmtpCommand;
 import com.icegreen.greenmail.smtp.commands.SmtpCommandRegistry;
+import com.icegreen.greenmail.util.DummySSLSocketFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.net.ssl.HandshakeCompletedEvent;
+import javax.net.ssl.HandshakeCompletedListener;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 
-class SmtpHandler implements ProtocolHandler {
+class SmtpHandler implements ProtocolHandler, HandshakeCompletedListener {
     private static final Logger log = LoggerFactory.getLogger(SmtpHandler.class);
 
     // protocol and configuration global stuff
@@ -33,6 +38,11 @@ class SmtpHandler implements ProtocolHandler {
     boolean _quitting;
     String _currentLine;
     private Socket _socket;
+    /*
+     * This is a temporary socket used for STARTTLS.
+     * It will replace _socket on successful SSL Handshake.
+     * */
+    private SSLSocket _sslSocketToExchange;
 
     public SmtpHandler(SmtpCommandRegistry registry,
                        SmtpManager manager, Workspace workspace, Socket socket) {
@@ -42,11 +52,16 @@ class SmtpHandler implements ProtocolHandler {
         _socket = socket;
     }
 
+    private void initConnection() throws IOException {
+
+        _conn = new SmtpConnection(this, _socket);
+        _state = new SmtpState(_workspace);
+    }
+
     @Override
     public void run() {
         try {
-            _conn = new SmtpConnection(this, _socket);
-            _state = new SmtpState(_workspace);
+            initConnection();
             _quitting = false;
 
             sendGreetings();
@@ -60,7 +75,7 @@ class SmtpHandler implements ProtocolHandler {
 
         } catch (Exception e) {
             // Closing socket on blocked read
-            if(!_quitting) {
+            if (!_quitting) {
                 log.error("Unexpected error handling connection, quitting=", e);
                 throw new IllegalStateException(e);
             }
@@ -86,23 +101,65 @@ class SmtpHandler implements ProtocolHandler {
             return;
         }
 
-        // eliminate invalid line lengths before parsing
-        if (!commandLegalSize()) {
 
-            return;
+        /*
+         * Check for STARTTLS command first. If it is, then handle the SSL Socket exchange separately
+         *
+         * TODO: What do we in case this is already a SSL Socket
+         **/
+
+        if (!handleStartTls()) {
+
+            // eliminate invalid line lengths before parsing
+            if (!commandLegalSize()) {
+
+                return;
+            }
+
+            String commandName = _currentLine.substring(0, 4).toUpperCase();
+
+            SmtpCommand command = _registry.getCommand(commandName);
+
+            if (command == null) {
+                _conn.send("500 Command not recognized");
+
+                return;
+            }
+
+            command.execute(_conn, _state, _manager, _currentLine);
+        }
+    }
+
+    private boolean handleStartTls() {
+
+        if (_currentLine.startsWith("STARTTLS")) {
+
+            //Check for any parameters/extra illegal characters sent
+            if (!_currentLine.equals("STARTTLS")) {
+                _conn.send("501 Syntax error (no parameters allowed)");
+            } else {
+                //Attempt setting up a SecureSocket to exchange
+                try {
+                    _sslSocketToExchange = createSslExchangeSocket();
+                    //Listen for handshake completion so we can exchange the sockets
+                    _sslSocketToExchange.addHandshakeCompletedListener(SmtpHandler.this);
+                    _conn.send("220 Ready to start TLS");
+                } catch (IOException e) {
+                    //Could not create SSLSocket. Reply with appropriate error
+                    _conn.send("454 TLS not available due to temporary reason");
+                }
+            }
+            return true;
         }
 
-        String commandName = _currentLine.substring(0, 4).toUpperCase();
+        return false;
+    }
 
-        SmtpCommand command = _registry.getCommand(commandName);
+    private SSLSocket createSslExchangeSocket() throws IOException {
 
-        if (command == null) {
-            _conn.send("500 Command not recognized");
-
-            return;
-        }
-
-        command.execute(_conn, _state, _manager, _currentLine);
+        final SSLSocket sslSocket = (SSLSocket) ((SSLSocketFactory) DummySSLSocketFactory.getDefault()).createSocket(_socket, null, _socket.getPort(), true);
+        sslSocket.setUseClientMode(false);
+        return sslSocket;
     }
 
     private boolean commandLegalSize() {
@@ -140,11 +197,42 @@ class SmtpHandler implements ProtocolHandler {
         }
         _quitting = true;
         try {
+
+            if (_sslSocketToExchange != null && !_sslSocketToExchange.isClosed()) {
+                /*
+                * At some point, STARTTLS was called, but no SSL negotiation was done.
+                * Since the socket was created in autoclose mode, closing this will also
+                * close the wrapped socket as well
+                **/
+                _sslSocketToExchange.removeHandshakeCompletedListener(SmtpHandler.this);
+                _sslSocketToExchange.close();
+                return;
+            }
             if (_socket != null && !_socket.isClosed()) {
                 _socket.close();
             }
-        } catch(IOException ignored) {
+        } catch (IOException ignored) {
             //empty
+        }
+    }
+
+    @Override
+    public void handshakeCompleted(HandshakeCompletedEvent handshakeCompletedEvent) {
+        //Handshake is successful. We can replace the socket with the new socket and reset the state
+        _sslSocketToExchange.removeHandshakeCompletedListener(SmtpHandler.this);
+        _socket = _sslSocketToExchange;
+        //We no longer need this since it's a temporary socket
+        _sslSocketToExchange = null;
+
+        //After this, we need to reset all SMTP state
+        _state.clearMessage();
+        _currentLine = null;
+
+        try {
+            initConnection();
+        } catch (IOException e) {
+            //Can anything else be done here apart from closing the connection?
+            close();
         }
     }
 }
